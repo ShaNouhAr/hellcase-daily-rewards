@@ -73,11 +73,60 @@ Le script va automatiquement :
 ```
 hellcase-daily-rewards/
 ├── hellcase_auto.py        # Script principal (Selenium)
-├── cookies.json            # Vos cookies (à créer, ignoré par git)
+├── discord_notify.py       # Notifications Discord via webhook
+├── cookies.json            # Vos cookies (auto-généré, ignoré par git)
+├── config.json             # URL webhook Discord (ignoré par git)
+├── config.example.json     # Template de configuration
 ├── requirements.txt        # Dépendances Python
-├── .gitignore             # Protège vos cookies
-└── README.md              # Ce fichier
+├── .gitignore              # Protège vos cookies & config
+└── README.md               # Ce fichier
 ```
+
+## 🔔 Notifications Discord
+
+À chaque run, un rapport détaillé peut être envoyé sur Discord via webhook :
+- ✅ statut des caisses (ouvertes / ignorées / erreurs)
+- 🎁 item obtenu + prix pour chaque caisse
+- 💵 solde + valeur totale de l'inventaire Hellcase
+- 🔒 alerte automatique si la session Steam est expirée (cookies invalides)
+
+### Configuration
+
+1. Sur Discord, clic droit sur le salon cible → **Modifier le salon** → **Intégrations** → **Webhooks** → **Nouveau webhook** → copier l'URL.
+
+2. Créer `config.json` (à partir de `config.example.json`) :
+
+   ```json
+   {
+       "discord_webhook_url": "https://discord.com/api/webhooks/XXXXXXXX/YYYYYYYY"
+   }
+   ```
+
+   Alternative : variable d'environnement `DISCORD_WEBHOOK_URL` (prioritaire sur `config.json`).
+
+3. Si la variable n'est pas définie et que `config.json` n'existe pas, les notifications sont simplement ignorées (aucune erreur).
+
+### Exécution automatique quotidienne (cron)
+
+```bash
+crontab -e
+```
+
+Ajouter :
+
+```
+0 10 * * * cd /home/USER/hellcase-daily-rewards && /usr/bin/python3 hellcase_auto.py >> /var/log/hellcase.log 2>&1
+```
+
+→ tous les jours à 10h, le script ouvre les caisses et envoie le rapport Discord.
+
+**Si les cookies expirent** (session Hellcase invalidée), le script détecte qu'il n'a pas de terminal interactif (cron) et envoie automatiquement une alerte Discord « Session expirée » avec les instructions pour rescanner le QR. Il suffit alors de se connecter en SSH et de lancer manuellement :
+
+```bash
+python3 hellcase_auto.py
+```
+
+Le QR s'affiche en ASCII dans le terminal, tu le scannes avec l'app Steam Mobile, les cookies sont sauvegardés automatiquement.
 
 ## ⚙️ Configuration
 

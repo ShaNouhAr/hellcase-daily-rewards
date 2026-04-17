@@ -1,6 +1,9 @@
 # Cookies - NE JAMAIS COMMITTER
 cookies.json
 
+# Config locale (contient l'URL du webhook Discord)
+config.json
+
 # Python
 __pycache__/
 *.py[cod]
