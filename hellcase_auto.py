@@ -28,6 +28,19 @@ import discord_notify
 BASE_URL = "https://hellcase.com"
 COOKIES_FILE = "cookies.json"
 
+# Mapping des caractères "masqués" de la font Hellcase "Currencies" vers leur
+# vrai symbole. Hellcase obfusque l'icône devise (un caractère ASCII différent
+# pour chaque devise) pour empêcher le scraping ; ce mapping a été fourni par
+# l'utilisateur après test visuel.
+CURRENCY_MAP = {
+    "1": "$",    # USD
+    "2": "€",    # EUR
+    "3": "£",    # GBP
+    "9": "R$",   # BRL
+    "50": "zł",  # PLN
+    "80": "lei", # RON
+}
+
 # Fallback si la détection automatique échoue
 FALLBACK_CASES = [
     {'name': 'NEWBIE', 'url': '/fr/open/newbie'},
@@ -448,42 +461,60 @@ class HellcaseAutoOpener:
 
     # ---- Ouverture d'une caisse ----
 
-    def _find_open_button(self):
-        """Retourne un bouton d'ouverture cliquable, ou None."""
-        selectors = [
-            "//button[contains(@class,'open') and not(@disabled)]",
-            "//button[contains(@class,'btn-open') and not(@disabled)]",
-            "//button[contains(@class,'case-open') and not(@disabled)]",
-            "//button[contains(text(),'Ouvrir')]",
-            "//button[contains(text(),'Open')]",
-            "//div[contains(@class,'open-button')]",
-            "//a[contains(@class,'open')]",
-        ]
-        for sel in selectors:
+    def _cooldown_text(self):
+        """Si la caisse est en cooldown, retourne le texte du timer (ex: '12H : 08MIN').
+
+        Hellcase affiche un div `_timer_*` dans la zone `_open-button_*` quand
+        la caisse a déjà été ouverte aujourd'hui et qu'il faut attendre.
+        """
+        for sel in (
+            "[class*='_open-button_'] [class*='_timer_']",
+            "[class*='_open_'] [class*='_timer_']",
+            "[class*='_timer_']",
+        ):
             try:
-                el = self.driver.find_element(By.XPATH, sel)
+                el = self.driver.find_element(By.CSS_SELECTOR, sel)
+                if el.is_displayed():
+                    txt = (el.text or "").strip()
+                    if txt:
+                        # Format "0JOUR : 12H : 08MIN" → on le nettoie
+                        return " ".join(txt.split())
+            except NoSuchElementException:
+                continue
+        return None
+
+    def _find_open_button(self):
+        """Retourne le bouton d'ouverture **réel** de la caisse, ou None.
+
+        Hellcase place le bouton d'ouverture dans un conteneur `_open-button_`.
+        Quand la caisse est en cooldown, ce conteneur affiche un timer à la
+        place du bouton — on doit donc vérifier qu'on a bien un bouton et pas
+        un timer.
+        """
+        # Chercher un bouton d'action dans la zone d'ouverture (pas RECHARGER
+        # ni TOUT ACCEPTER qui sont ailleurs sur la page).
+        for sel in (
+            "[class*='_open-button_'] button:not([disabled])",
+            "[class*='_open-button_'] a",
+            "[class*='_open_'] button:not([disabled])",
+        ):
+            try:
+                el = self.driver.find_element(By.CSS_SELECTOR, sel)
                 if el.is_displayed() and el.is_enabled():
-                    return el
+                    txt = (el.text or "").strip().upper()
+                    # Un vrai bouton d'ouverture contient "OUVRIR" / "OPEN"
+                    # (évite par exemple "RECHARGER" qui apparaît si pas de bouton)
+                    if any(kw in txt for kw in ("OUVRIR", "OPEN", "GRATUIT", "FREE")):
+                        return el
             except NoSuchElementException:
                 continue
         return None
 
     def _unavailable_reason(self):
         """Tente d'identifier pourquoi une caisse n'est pas ouvrable."""
-        # Timer / cooldown
-        for sel in (
-            "//*[contains(@class,'timer')]",
-            "//*[contains(@class,'cooldown')]",
-            "//*[contains(@class,'countdown')]",
-            "//*[contains(text(),'Prochaine')]",
-            "//*[contains(text(),'Next')]",
-        ):
-            try:
-                el = self.driver.find_element(By.XPATH, sel)
-                if el.is_displayed() and el.text.strip():
-                    return f"cooldown ({el.text.strip()})"
-            except NoSuchElementException:
-                continue
+        cd = self._cooldown_text()
+        if cd:
+            return f"cooldown ({cd})"
 
         # Abonnement / niveau requis
         for sel in (
@@ -492,6 +523,7 @@ class HellcaseAutoOpener:
             "//*[contains(text(),'Premium')]",
             "//*[contains(text(),'niveau')]",
             "//*[contains(text(),'level')]",
+            "//*[contains(text(),'NIVEAU')]",
         ):
             try:
                 el = self.driver.find_element(By.XPATH, sel)
@@ -512,7 +544,15 @@ class HellcaseAutoOpener:
         name = case['name']
         print(f"\n🎁 {name}")
         self.driver.get(BASE_URL + case['url'])
-        time.sleep(3)
+        time.sleep(4)
+
+        # Vérifier d'abord le cooldown (caisse déjà ouverte aujourd'hui)
+        cd = self._cooldown_text()
+        if cd:
+            reason = f"déjà ouverte — prochain run dans {cd}"
+            print(f"  ⏸  {reason}")
+            return {"name": name, "status": "skipped", "item": None,
+                    "price": None, "reason": reason}
 
         button = self._find_open_button()
         if not button:
@@ -520,6 +560,10 @@ class HellcaseAutoOpener:
             print(f"  ⏸  {reason}")
             return {"name": name, "status": "skipped", "item": None,
                     "price": None, "reason": reason}
+
+        # Mémoriser les noms d'items déjà présents AVANT le clic (preview de la
+        # caisse) pour pouvoir ensuite identifier le nouveau drop.
+        pre_click_names = self._collect_item_names()
 
         try:
             button.click()
@@ -529,63 +573,122 @@ class HellcaseAutoOpener:
             return {"name": name, "status": "error", "item": None,
                     "price": None, "reason": str(e)[:120]}
 
-        time.sleep(6)
-        item_name, item_price = self._extract_obtained_item()
+        # Attendre la fin de l'animation de roulette (~8s)
+        time.sleep(9)
+
+        item_name, item_price = self._extract_obtained_item(pre_click_names)
         if item_name:
             suffix = f" ({item_price})" if item_price else ""
             print(f"  🎉 Item obtenu : {item_name}{suffix}")
         return {"name": name, "status": "opened", "item": item_name,
                 "price": item_price, "reason": None}
 
-    def _extract_obtained_item(self):
-        """Essaye d'extraire le nom + prix de l'item obtenu après ouverture.
+    def _collect_item_names(self):
+        """Retourne l'ensemble des noms d'items visibles sur la page."""
+        names = set()
+        try:
+            for el in self.driver.find_elements(By.CSS_SELECTOR, "[class*='_name_']"):
+                try:
+                    t = (el.text or "").strip()
+                    if t and 0 < len(t) < 80 and not t.isdigit():
+                        names.add(t)
+                except Exception:
+                    continue
+        except Exception:
+            pass
+        return names
 
-        Testé sur les pages /fr/open/... : le résultat apparaît dans un panneau
-        avec les classes dynamiques `_name_*` / `_price_*` (Vue hash CSS).
+    def _extract_obtained_item(self, pre_click_names=None):
+        """Extrait le drop réel obtenu après ouverture.
+
+        Stratégie :
+        1. Cherche un conteneur de résultat (`_drop_`, `_result_`, `_prize_`, …)
+           qui apparaît après l'animation et contient l'item gagné.
+        2. Sinon, prend un `_name_` qui n'était PAS dans la preview de la caisse
+           (diff avec `pre_click_names`).
         """
-        name = None
-        price = None
-        for sel in (
-            "[class*='_name_']",
-            "[class*='item-name']",
-            "[class*='drop-name']",
-            "[class*='prize-name']",
+        pre_click_names = pre_click_names or set()
+        name, price = None, None
+
+        # 1) Conteneurs de résultat typiques d'Hellcase
+        for container_sel in (
+            "[class*='_drop-result_']",
+            "[class*='_result_']",
+            "[class*='_prize_']",
+            "[class*='_drop_']",
+            "[class*='_won_']",
+            "[class*='_winning_']",
         ):
             try:
-                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                containers = self.driver.find_elements(By.CSS_SELECTOR, container_sel)
             except Exception:
                 continue
-            for el in els:
+            for c in containers:
                 try:
-                    txt = (el.text or "").strip()
-                    if txt and len(txt) < 120 and not txt.isdigit():
-                        name = txt
+                    if not c.is_displayed():
+                        continue
+                    name_el = c.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
+                    price_el = c.find_elements(By.CSS_SELECTOR, "[class*='_price_']")
+                    if name_el:
+                        t = (name_el[0].text or "").strip()
+                        if t and len(t) < 80:
+                            name = t
+                    if price_el:
+                        name, price = self._extract_item_from_container(c)
+                    if name:
                         break
                 except Exception:
                     continue
             if name:
                 break
 
-        for sel in (
-            "[class*='_price_']",
-            "[class*='item-price']",
-            "[class*='drop-price']",
-        ):
+        # 2) Fallback : un nouveau nom d'item apparu après le clic
+        if not name:
+            current = self._collect_item_names()
+            new_names = current - pre_click_names
+            if new_names:
+                name = next(iter(new_names))
+
+        # Prix : chercher un prix associé au nom trouvé (dans son parent direct)
+        if name and not price:
             try:
-                els = self.driver.find_elements(By.CSS_SELECTOR, sel)
+                xp = f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'_price_')]][1]"
+                parent = self.driver.find_element(By.XPATH, xp)
+                price = self._first_clean_price(parent)
             except Exception:
-                continue
-            for el in els:
+                pass
+
+        return name, price
+
+    @staticmethod
+    def _first_clean_price(root_element):
+        """Premier prix 'propre' (entier ou décimal court) trouvé dans root."""
+        import re as _re
+        try:
+            for el in root_element.find_elements(By.CSS_SELECTOR, "[class*='_price_']"):
                 try:
-                    txt = (el.text or "").strip().replace("\n", " ")
-                    # Chercher un nombre (avec . ou ,) — ignore les animations de rouleau
-                    if txt and any(ch.isdigit() for ch in txt) and len(txt) < 30:
-                        price = txt
-                        break
+                    t = (el.text or "").strip().replace(",", ".").replace("\n", "")
+                    m = _re.fullmatch(r"(\d{1,7}(?:\.\d{1,2})?)", t)
+                    if m:
+                        return m.group(1)
                 except Exception:
                     continue
-            if price:
-                break
+        except Exception:
+            pass
+        return None
+
+    def _extract_item_from_container(self, container):
+        """Extrait (name, price) d'un conteneur de drop."""
+        name, price = None, None
+        try:
+            n = container.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
+            if n:
+                t = (n[0].text or "").strip()
+                if t and len(t) < 80:
+                    name = t
+        except Exception:
+            pass
+        price = self._first_clean_price(container)
         return name, price
 
     def run(self):
@@ -613,14 +716,17 @@ class HellcaseAutoOpener:
         print("\n📦 Récupération de l'inventaire Hellcase...")
         inventory = self._fetch_inventory_summary()
         if inventory:
-            if inventory.get("balance"):
-                print(f"  💵 Solde   : {inventory['balance']}")
-            if inventory.get("credits"):
-                print(f"  🪙 Crédits : {inventory['credits']}")
+            curr = inventory.get("currency")
+            if curr:
+                print(f"  🏳  Devise détectée : {curr}")
+            balance = discord_notify._fmt_price(inventory.get("balance"), currency=curr)
+            if balance:
+                print(f"  💵 Solde  : {balance}")
             if inventory.get("items_count") is not None:
-                print(f"  📦 Items   : {inventory['items_count']}")
-            if inventory.get("items_value"):
-                print(f"  💎 Valeur  : {inventory['items_value']}")
+                print(f"  📦 Items  : {inventory['items_count']}")
+            value = discord_notify._fmt_price(inventory.get("items_value"), currency=curr)
+            if value:
+                print(f"  💎 Valeur : {value}")
 
         self._persist_cookies()
 
@@ -647,17 +753,29 @@ class HellcaseAutoOpener:
         except Exception:
             return None
 
-        info = {"balance": None, "credits": None,
-                "items_count": None, "items_value": None, "recent_items": []}
+        info = {"balance": None, "items_count": None,
+                "items_value": None, "recent_items": [], "currency": None}
 
-        # Solde ($) — div avec class "_balances_" contient le prix
+        # Solde — div avec class "_balances_" contient l'icône devise + prix
+        # Format DOM : <div class="_balances_*"><span class="currency-icon">X</span>2.77</div>
+        # Le contenu du span `core-currency-icon` désigne la devise (mapping
+        # propre à la font Hellcase "Currencies" — voir _detect_currency).
         try:
             bal = self.driver.find_element(By.CSS_SELECTOR, "[class*='_balances_']")
+            try:
+                icon = bal.find_element(By.CSS_SELECTOR, ".core-currency-icon")
+                code = (icon.text or "").strip()
+                info["currency"] = CURRENCY_MAP.get(code)
+            except NoSuchElementException:
+                pass
+
             txt = (bal.text or "").strip().replace("\n", " ")
-            # Format "<icon>2</icon>2.77" → text = "2 2.77" ; on garde la dernière valeur décimale
-            parts = [p for p in txt.split() if p.replace(".", "").replace(",", "").isdigit()]
-            if parts:
-                info["balance"] = f"${parts[-1]}"
+            import re as _re
+            nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
+            if nums:
+                # Le plus gros nombre décimal est le solde ; sinon le dernier nombre
+                with_dec = [n for n in nums if "." in n or "," in n]
+                info["balance"] = (with_dec[-1] if with_dec else nums[-1]).replace(",", ".")
         except NoSuchElementException:
             pass
 
@@ -729,9 +847,10 @@ class HellcaseAutoOpener:
         if uniq_items:
             info["items_count"] = len(uniq_items)
             info["recent_items"] = uniq_items[:10]
-            total_credits = sum(i["price"] for i in uniq_items if i["price"] is not None)
-            if total_credits > 0:
-                info["items_value"] = f"{total_credits:.0f} crédits"
+            total = sum(i["price"] for i in uniq_items if i["price"] is not None)
+            if total > 0:
+                # Valeur brute — sera formatée avec le symbole de devise config
+                info["items_value"] = total
 
         return info
 

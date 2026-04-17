@@ -22,16 +22,48 @@ from urllib.error import HTTPError, URLError
 CONFIG_FILE = "config.json"
 
 
+def _load_config() -> dict:
+    try:
+        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
 def _load_webhook_url() -> Optional[str]:
     url = os.environ.get("DISCORD_WEBHOOK_URL")
     if url:
         return url.strip()
-    try:
-        with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-            cfg = json.load(f)
-        return (cfg.get("discord_webhook_url") or "").strip() or None
-    except (FileNotFoundError, json.JSONDecodeError):
+    cfg = _load_config()
+    return (cfg.get("discord_webhook_url") or "").strip() or None
+
+
+def _currency_symbol(override=None) -> str:
+    """Retourne le symbole à utiliser.
+
+    Priorité : argument `override` (devise détectée depuis la page) > variable
+    d'env `HELLCASE_CURRENCY` > `config.json` > "$".
+    """
+    if override:
+        return str(override).strip()
+    sym = os.environ.get("HELLCASE_CURRENCY")
+    if sym:
+        return sym.strip()
+    cfg = _load_config()
+    return (cfg.get("currency_symbol") or "$").strip() or "$"
+
+
+def _fmt_price(value, currency=None):
+    """Formate une valeur numérique avec le symbole de devise."""
+    if value is None or value == "":
         return None
+    sym = _currency_symbol(currency)
+    try:
+        n = float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return f"{value} {sym}"
+    text = f"{n:.2f}" if abs(n) < 10000 and n != int(n) else f"{n:g}"
+    return f"{text} {sym}"
 
 
 def _post(webhook_url: str, payload: dict) -> bool:
@@ -91,6 +123,9 @@ def notify_run_summary(
 
     fields = []
 
+    # Détecter la devise (passée via inventory) pour formater les prix
+    curr = (inventory or {}).get("currency")
+
     # Détail par caisse
     lines = []
     for r in cases_results:
@@ -98,7 +133,7 @@ def notify_run_summary(
         status = r.get("status")
         if status == "opened":
             item = r.get("item") or "?"
-            price = r.get("price")
+            price = _fmt_price(r.get("price"), currency=curr)
             suffix = f" — **{item}**" + (f" ({price})" if price else "")
             lines.append(f"🎁 `{name}`{suffix}")
         elif status == "skipped":
@@ -124,14 +159,14 @@ def notify_run_summary(
     # Inventaire
     if inventory:
         inv_lines = []
-        if inventory.get("balance"):
-            inv_lines.append(f"💵 Solde : **{inventory['balance']}**")
-        if inventory.get("credits"):
-            inv_lines.append(f"🪙 Crédits : **{inventory['credits']}**")
+        balance = _fmt_price(inventory.get("balance"), currency=curr)
+        if balance:
+            inv_lines.append(f"💵 Solde : **{balance}**")
         if inventory.get("items_count") is not None:
             inv_lines.append(f"📦 Items : **{inventory['items_count']}**")
-        if inventory.get("items_value"):
-            inv_lines.append(f"💎 Valeur totale : **{inventory['items_value']}**")
+        total_value = _fmt_price(inventory.get("items_value"), currency=curr)
+        if total_value:
+            inv_lines.append(f"💎 Valeur totale : **{total_value}**")
         if inv_lines:
             fields.append({
                 "name": "Inventaire",

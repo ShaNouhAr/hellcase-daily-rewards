@@ -98,11 +98,13 @@ hellcase-daily-rewards/
 
    ```json
    {
-       "discord_webhook_url": "https://discord.com/api/webhooks/XXXXXXXX/YYYYYYYY"
+       "discord_webhook_url": "https://discord.com/api/webhooks/XXXXXXXX/YYYYYYYY",
+       "currency_symbol": "$"
    }
    ```
 
-   Alternative : variable d'environnement `DISCORD_WEBHOOK_URL` (prioritaire sur `config.json`).
+   - `discord_webhook_url` : URL du webhook Discord (alternative : variable d'env `DISCORD_WEBHOOK_URL`, prioritaire).
+   - `currency_symbol` : **override manuel** du symbole. En temps normal la devise est auto-détectée depuis la page (mapping interne `1=$`, `2=€`, `3=£`, `9=R$`, `50=zł`, `80=lei`). Ne remplir ce champ que si l'auto-détection échoue ou si tu veux forcer un autre symbole. Défaut : `"$"`.
 
 3. Si la variable n'est pas définie et que `config.json` n'existe pas, les notifications sont simplement ignorées (aucune erreur).
 
