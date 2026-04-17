@@ -53,6 +53,16 @@ def _currency_symbol(override=None) -> str:
     return (cfg.get("currency_symbol") or "$").strip() or "$"
 
 
+def _to_float(value):
+    """Convertit une valeur (str/float/int) en float, ou None si impossible."""
+    if value is None or value == "":
+        return None
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+
+
 def _fmt_price(value, currency=None):
     """Formate une valeur numérique avec le symbole de devise."""
     if value is None or value == "":
@@ -159,14 +169,23 @@ def notify_run_summary(
     # Inventaire
     if inventory:
         inv_lines = []
-        balance = _fmt_price(inventory.get("balance"), currency=curr)
+        raw_balance = _to_float(inventory.get("balance"))
+        raw_items_value = _to_float(inventory.get("items_value"))
+
+        balance = _fmt_price(raw_balance, currency=curr)
         if balance:
             inv_lines.append(f"💵 Solde : **{balance}**")
         if inventory.get("items_count") is not None:
-            inv_lines.append(f"📦 Items : **{inventory['items_count']}**")
-        total_value = _fmt_price(inventory.get("items_value"), currency=curr)
-        if total_value:
-            inv_lines.append(f"💎 Valeur totale : **{total_value}**")
+            items_val = _fmt_price(raw_items_value or 0, currency=curr)
+            inv_lines.append(
+                f"📦 Items : **{inventory['items_count']}** ({items_val})"
+            )
+        # Valeur totale = solde + valeur des items
+        total = (raw_balance or 0) + (raw_items_value or 0)
+        if total > 0 or raw_balance is not None or raw_items_value is not None:
+            inv_lines.append(
+                f"💎 Valeur totale : **{_fmt_price(total, currency=curr)}**"
+            )
         if inv_lines:
             fields.append({
                 "name": "Inventaire",

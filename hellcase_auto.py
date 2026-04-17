@@ -719,14 +719,17 @@ class HellcaseAutoOpener:
             curr = inventory.get("currency")
             if curr:
                 print(f"  🏳  Devise détectée : {curr}")
-            balance = discord_notify._fmt_price(inventory.get("balance"), currency=curr)
+            raw_balance = discord_notify._to_float(inventory.get("balance"))
+            raw_items = discord_notify._to_float(inventory.get("items_value"))
+            balance = discord_notify._fmt_price(raw_balance, currency=curr)
             if balance:
-                print(f"  💵 Solde  : {balance}")
+                print(f"  💵 Solde   : {balance}")
             if inventory.get("items_count") is not None:
-                print(f"  📦 Items  : {inventory['items_count']}")
-            value = discord_notify._fmt_price(inventory.get("items_value"), currency=curr)
-            if value:
-                print(f"  💎 Valeur : {value}")
+                items_val = discord_notify._fmt_price(raw_items or 0, currency=curr)
+                print(f"  📦 Items   : {inventory['items_count']} ({items_val})")
+            total = (raw_balance or 0) + (raw_items or 0)
+            if total > 0 or raw_balance is not None:
+                print(f"  💎 Valeur  : {discord_notify._fmt_price(total, currency=curr)}")
 
         self._persist_cookies()
 
@@ -779,62 +782,66 @@ class HellcaseAutoOpener:
         except NoSuchElementException:
             pass
 
-        # Items d'inventaire : on associe chaque nom à un prix voisin en
-        # remontant au parent commun (composant item Vue). La classe Vue
-        # encode un hash stable par composant (ex: `_name_wz93x_29` et
-        # `_price_wz93x_30` partagent le même suffixe `wz93x`).
+        # Items d'inventaire : on cible EXCLUSIVEMENT la section "Vos objets"
+        # sur le profil (sinon on ramasse par erreur les "Meilleurs objets"
+        # qui sont les top drops du site, pas les items de l'utilisateur).
         import re as _re
 
-        def _clean_price(txt):
-            # Ne garder que les prix entiers ou décimaux "propres" (pas les
-            # rouleaux d'animation qui empilent 0-9 verticalement).
-            t = (txt or "").strip().replace(",", ".").replace("\n", "")
-            m = _re.fullmatch(r"(\d{1,7}(?:\.\d{1,2})?)", t)
-            return float(m.group(1)) if m else None
+        info["items_count"] = 0
+        info["items_value"] = 0
+
+        try:
+            your_section = self.driver.find_element(
+                By.XPATH,
+                "//div[contains(@class,'profile-tab-items-new__section')"
+                "   and .//div[contains(@class,'profile-tab-items-new__title')"
+                "              and (normalize-space(.)='Vos objets'"
+                "                   or normalize-space(.)='Your items'"
+                "                   or normalize-space(.)='Ваши вещи')]]"
+            )
+        except NoSuchElementException:
+            # Pas de section "Vos objets" visible → inventaire vide par défaut
+            return info
+
+        section_text = (your_section.text or "")
+        empty_markers = ("pas d'objet", "no items", "нет предметов")
+        if any(m in section_text.lower() for m in empty_markers):
+            return info
+
+        slides = your_section.find_elements(
+            By.CSS_SELECTOR, "[class*='core-entity-profile']"
+        )
 
         items = []
-        try:
-            name_els = self.driver.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
-        except Exception:
-            name_els = []
+        for slide in slides:
+            # Nom de l'item : subtitle = catégorie (★ Knife / AK-47…), title = skin
+            name_text = None
+            for sel in (".core-entity-profile__title", ".core-entity-profile__subtitle"):
+                try:
+                    el = slide.find_element(By.CSS_SELECTOR, sel)
+                    t = (el.text or "").strip()
+                    if t:
+                        name_text = t if not name_text else f"{t} — {name_text}".strip(" —")
+                except NoSuchElementException:
+                    continue
 
-        for name_el in name_els:
-            try:
-                name_text = (name_el.text or "").strip()
-            except Exception:
-                continue
-            if not name_text or name_text.isdigit() or len(name_text) > 80:
-                continue
-
-            # Extraire le hash Vue du composant : `_name_wz93x_29` → `wz93x`
-            cls = name_el.get_attribute("class") or ""
-            m = _re.search(r"_name_([a-z0-9]+)_", cls)
-            vue_hash = m.group(1) if m else None
-
+            # Prix : chercher une valeur numérique dans le slide (1er nombre avec
+            # décimales de préférence, sinon entier).
             price_val = None
-            try:
-                # Remonter jusqu'au parent commun qui contient le prix associé
-                parent = name_el
-                for _ in range(5):
-                    parent = parent.find_element(By.XPATH, "..")
-                    price_selector = (
-                        f"[class*='_price_{vue_hash}']" if vue_hash
-                        else "[class*='_price_']"
-                    )
-                    prices_in_parent = parent.find_elements(By.CSS_SELECTOR, price_selector)
-                    for p_el in prices_in_parent:
-                        val = _clean_price(p_el.text)
-                        if val is not None:
-                            price_val = val
-                            break
-                    if price_val is not None:
-                        break
-            except Exception:
-                pass
+            txt = (slide.text or "").replace("\n", " ")
+            nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
+            with_dec = [n for n in nums if "." in n or "," in n]
+            candidate = (with_dec[0] if with_dec else (nums[0] if nums else None))
+            if candidate:
+                try:
+                    price_val = float(candidate.replace(",", "."))
+                except ValueError:
+                    pass
 
-            items.append({"name": name_text, "price": price_val})
+            if name_text or price_val is not None:
+                items.append({"name": name_text or "?", "price": price_val})
 
-        # Dédoublonner par (name, price)
+        # Dédoublonner par (name, price) — un même item peut apparaître plusieurs fois
         seen = set()
         uniq_items = []
         for it in items:
@@ -844,13 +851,9 @@ class HellcaseAutoOpener:
             seen.add(key)
             uniq_items.append(it)
 
-        if uniq_items:
-            info["items_count"] = len(uniq_items)
-            info["recent_items"] = uniq_items[:10]
-            total = sum(i["price"] for i in uniq_items if i["price"] is not None)
-            if total > 0:
-                # Valeur brute — sera formatée avec le symbole de devise config
-                info["items_value"] = total
+        info["items_count"] = len(uniq_items)
+        info["recent_items"] = uniq_items[:10]
+        info["items_value"] = sum(i["price"] for i in uniq_items if i["price"] is not None)
 
         return info
 
