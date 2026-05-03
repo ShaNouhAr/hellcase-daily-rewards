@@ -41,6 +41,14 @@ CURRENCY_MAP = {
     "80": "lei", # RON
 }
 
+# Prix affiché après ouverture : UI "core-*" en plus des anciennes classes _price_
+PRICE_SELECTORS = (
+    ".core-entity-main__price",
+    "[class*='core-entity-main__price']",
+    "[class*='core-price']",
+    "[class*='_price_']",
+)
+
 # Fallback si la détection automatique échoue
 FALLBACK_CASES = [
     {'name': 'NEWBIE', 'url': '/fr/open/newbie'},
@@ -618,6 +626,7 @@ class HellcaseAutoOpener:
             "[class*='_drop_']",
             "[class*='_won_']",
             "[class*='_winning_']",
+            "[class*='core-entity-main']",
         ):
             try:
                 containers = self.driver.find_elements(By.CSS_SELECTOR, container_sel)
@@ -628,13 +637,16 @@ class HellcaseAutoOpener:
                     if not c.is_displayed():
                         continue
                     name_el = c.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
-                    price_el = c.find_elements(By.CSS_SELECTOR, "[class*='_price_']")
                     if name_el:
                         t = (name_el[0].text or "").strip()
                         if t and len(t) < 80:
                             name = t
-                    if price_el:
-                        name, price = self._extract_item_from_container(c)
+                    # Prix souvent en core-entity-main__price / core-price (plus en _price_)
+                    ex_name, ex_price = self._extract_item_from_container(c)
+                    if ex_price:
+                        price = ex_price
+                    if ex_name and not name:
+                        name = ex_name
                     if name:
                         break
                 except Exception:
@@ -649,30 +661,85 @@ class HellcaseAutoOpener:
             if new_names:
                 name = next(iter(new_names))
 
-        # Prix : chercher un prix associé au nom trouvé (dans son parent direct)
+        # Prix : chercher un prix associé au nom trouvé (ancien _price_ ou core-*)
         if name and not price:
-            try:
-                xp = f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'_price_')]][1]"
-                parent = self.driver.find_element(By.XPATH, xp)
-                price = self._first_clean_price(parent)
-            except Exception:
-                pass
+            for xpath in (
+                f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'_price_')]][1]",
+                f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'core-entity-main__price') or contains(@class,'core-price')]][1]",
+            ):
+                try:
+                    parent = self.driver.find_element(By.XPATH, xpath)
+                    price = HellcaseAutoOpener._first_clean_price(parent)
+                    if price:
+                        break
+                except Exception:
+                    continue
 
         return name, price
+
+    @staticmethod
+    def _parse_price_text(raw):
+        """Extrait un nombre prix depuis le texte (ignore bruit / devise obfusquée)."""
+        import re as _re
+        if not raw:
+            return None
+        t = raw.strip().replace("\n", " ")
+        m = _re.search(r"(\d{1,7}(?:[.,]\d{1,2})?)", t.replace(",", "."))
+        if not m:
+            return None
+        return m.group(1).replace(",", ".")
+
+    @staticmethod
+    def _price_amount_text_from_core_price_element(driver, pel):
+        """Texte du montant seul dans un bloc .core-price (sans l'icône devise).
+
+        Hellcase affiche l'euro comme un caractère « 2 » dans .core-currency-icon ;
+        Selenium concatène en « 20.14 » au lieu de « 0.14 » si on lit pel.text.
+        """
+        try:
+            s = driver.execute_script(
+                r"""
+                const el = arguments[0];
+                if (!el) return '';
+                let out = '';
+                for (const n of el.childNodes) {
+                  if (n.nodeType === 3) {
+                    out += (n.textContent || '');
+                  } else if (n.nodeType === 1) {
+                    if (n.classList && n.classList.contains('core-currency-icon')) continue;
+                    out += (n.innerText || n.textContent || '');
+                  }
+                }
+                let s = out.replace(/\s+/g, '').trim();
+                if (!s || !/\d/.test(s)) {
+                  let t = '';
+                  el.querySelectorAll('span:not(.core-currency-icon)').forEach(
+                    x => { t += (x.innerText || x.textContent || ''); });
+                  s = t.replace(/\s+/g, '').trim();
+                }
+                if (!s) s = (el.innerText || '').replace(/\s+/g, '').trim();
+                return s;
+                """,
+                pel,
+            )
+            return (s or "").strip()
+        except Exception:
+            return (pel.text or "").replace("\n", " ").strip()
 
     @staticmethod
     def _first_clean_price(root_element):
         """Premier prix 'propre' (entier ou décimal court) trouvé dans root."""
         import re as _re
         try:
-            for el in root_element.find_elements(By.CSS_SELECTOR, "[class*='_price_']"):
-                try:
-                    t = (el.text or "").strip().replace(",", ".").replace("\n", "")
-                    m = _re.fullmatch(r"(\d{1,7}(?:\.\d{1,2})?)", t)
-                    if m:
-                        return m.group(1)
-                except Exception:
-                    continue
+            for sel in PRICE_SELECTORS:
+                for el in root_element.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        t = (el.text or "").strip().replace(",", ".").replace("\n", "")
+                        parsed = HellcaseAutoOpener._parse_price_text(t)
+                        if parsed and _re.fullmatch(r"\d{1,7}(?:\.\d{1,2})?", parsed):
+                            return parsed
+                    except Exception:
+                        continue
         except Exception:
             pass
         return None
@@ -752,7 +819,22 @@ class HellcaseAutoOpener:
         """
         try:
             self.driver.get(f"{BASE_URL}/fr/profile")
-            time.sleep(5)
+            time.sleep(4)
+            # L'inventaire joueur est sur …/profile/{id}/items (pas la racine /profile)
+            try:
+                import re as _re_items_url
+                for link in self.driver.find_elements(
+                    By.CSS_SELECTOR, "a[href*='/profile/'][href*='/items']"
+                ):
+                    href = (link.get_attribute("href") or "").strip()
+                    if _re_items_url.search(r"/profile/\d+/items", href):
+                        self.driver.get(href)
+                        time.sleep(5)
+                        break
+                else:
+                    time.sleep(1)
+            except Exception:
+                time.sleep(1)
         except Exception:
             return None
 
@@ -797,7 +879,8 @@ class HellcaseAutoOpener:
                 "   and .//div[contains(@class,'profile-tab-items-new__title')"
                 "              and (normalize-space(.)='Vos objets'"
                 "                   or normalize-space(.)='Your items'"
-                "                   or normalize-space(.)='Ваши вещи')]]"
+                "                   or normalize-space(.)='Ваши вещи'"
+                "                   or normalize-space(.)='Seus itens')]]"
             )
         except NoSuchElementException:
             # Pas de section "Vos objets" visible → inventaire vide par défaut
@@ -808,12 +891,34 @@ class HellcaseAutoOpener:
         if any(m in section_text.lower() for m in empty_markers):
             return info
 
+        # Uniquement la grille « Vos objets » : cartes directes sous
+        # .profile-tab-items-new__items (pas le slider « Meilleurs objets » ni
+        # l'historique — ceux-ci sont dans __items-slider ou autres blocs).
         slides = your_section.find_elements(
-            By.CSS_SELECTOR, "[class*='core-entity-profile']"
+            By.CSS_SELECTOR, ".profile-tab-items-new__items > .core-entity-profile"
         )
+        if not slides:
+            slides = []
+            for el in your_section.find_elements(
+                By.CSS_SELECTOR, ".profile-tab-items-new__items .core-entity-profile"
+            ):
+                try:
+                    el.find_element(
+                        By.XPATH,
+                        "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
+                    )
+                except NoSuchElementException:
+                    slides.append(el)
 
         items = []
         for slide in slides:
+            # Ignorer cartes type promo / placeholder sans vrai item
+            try:
+                if "card" in (slide.get_attribute("class") or ""):
+                    continue
+            except Exception:
+                pass
+
             # Nom de l'item : subtitle = catégorie (★ Knife / AK-47…), title = skin
             name_text = None
             for sel in (".core-entity-profile__title", ".core-entity-profile__subtitle"):
@@ -825,18 +930,36 @@ class HellcaseAutoOpener:
                 except NoSuchElementException:
                     continue
 
-            # Prix : chercher une valeur numérique dans le slide (1er nombre avec
-            # décimales de préférence, sinon entier).
+            # Prix : bloc .core-entity__top-left uniquement (pas les boutons Vendre).
+            # Montant via JS : exclure .core-currency-icon (sinon « 2 »+« 0.14 » → « 20.14 »).
             price_val = None
-            txt = (slide.text or "").replace("\n", " ")
-            nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
-            with_dec = [n for n in nums if "." in n or "," in n]
-            candidate = (with_dec[0] if with_dec else (nums[0] if nums else None))
-            if candidate:
+            for psel in (
+                ".core-entity__top-left .core-entity-profile__price",
+                ".core-entity__top-left .core-price",
+                ".core-entity-profile__price",
+                ".core-price.core-entity-profile__price",
+            ):
                 try:
-                    price_val = float(candidate.replace(",", "."))
-                except ValueError:
-                    pass
+                    pel = slide.find_element(By.CSS_SELECTOR, psel)
+                    raw = HellcaseAutoOpener._price_amount_text_from_core_price_element(
+                        self.driver, pel
+                    )
+                    parsed = HellcaseAutoOpener._parse_price_text(raw.replace(" ", ""))
+                    if parsed:
+                        price_val = float(parsed)
+                        break
+                except (NoSuchElementException, ValueError):
+                    continue
+            if price_val is None:
+                txt = (slide.text or "").replace("\n", " ")
+                nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
+                with_dec = [n for n in nums if "." in n or "," in n]
+                candidate = (with_dec[0] if with_dec else (nums[0] if nums else None))
+                if candidate:
+                    try:
+                        price_val = float(candidate.replace(",", "."))
+                    except ValueError:
+                        pass
 
             if name_text or price_val is not None:
                 items.append({"name": name_text or "?", "price": price_val})
