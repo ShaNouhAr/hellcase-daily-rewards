@@ -27,6 +27,16 @@ import discord_notify
 
 BASE_URL = "https://hellcase.com"
 COOKIES_FILE = "cookies.json"
+LAST_RUN_JSON = "last_run.json"
+
+# Statuts caisse dans last_run.json (compact)
+_CASE_ST_SHORT = {"opened": "o", "skipped": "s", "error": "e"}
+
+
+def write_last_run_json(payload: dict) -> None:
+    """Réécrit last_run.json sur une seule ligne (léger)."""
+    with open(LAST_RUN_JSON, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
 
 # Mapping des caractères "masqués" de la font Hellcase "Currencies" vers leur
 # vrai symbole. Hellcase obfusque l'icône devise (un caractère ASCII différent
@@ -40,14 +50,6 @@ CURRENCY_MAP = {
     "50": "zł",  # PLN
     "80": "lei", # RON
 }
-
-# Prix affiché après ouverture : UI "core-*" en plus des anciennes classes _price_
-PRICE_SELECTORS = (
-    ".core-entity-main__price",
-    "[class*='core-entity-main__price']",
-    "[class*='core-price']",
-    "[class*='_price_']",
-)
 
 # Fallback si la détection automatique échoue
 FALLBACK_CASES = [
@@ -289,9 +291,60 @@ def steam_qr_auth(driver, cookies_file):
 class HellcaseAutoOpener:
     def __init__(self, cookies_file=COOKIES_FILE, headless=True):
         self.cookies_file = cookies_file
+        self._cookies_file_existed = os.path.exists(self.cookies_file)
+        self._session_valid_at_start = False
+        self._cookies_saved_after_run = None
         print("🚀 Initialisation du navigateur...")
         self._setup_driver(headless)
         self._ensure_session()
+
+    def _session_stats_dict(self):
+        """Stats session / cookies pour Discord (résumé court)."""
+        return {
+            "cookies_file_present": self._cookies_file_existed,
+            "session_valid_at_start": self._session_valid_at_start,
+            "cookies_saved_after_run": self._cookies_saved_after_run,
+        }
+
+    def _write_last_run_compact(
+        self,
+        *,
+        status: str,
+        discord_sent: bool,
+        results=None,
+        inventory=None,
+    ):
+        """Écrit last_run.json minimaliste : `status` ok | abort_tty | abort_qr."""
+        at = datetime.now().isoformat(timespec="seconds")
+        payload = {
+            "at": at,
+            "status": status,
+            "login_ok_start": self._session_valid_at_start,
+            "cookie_file": self._cookies_file_existed,
+            "cookies_saved": self._cookies_saved_after_run,
+            "discord": discord_sent,
+        }
+        if status == "ok" and results is not None:
+            payload["cases"] = {
+                r["name"]: _CASE_ST_SHORT.get(r.get("status"), "?")
+                for r in results
+            }
+            if inventory:
+                curr = inventory.get("currency")
+                payload["balance"] = inventory.get("balance")
+                payload["items"] = inventory.get("items_count")
+                iv = inventory.get("items_value")
+                if iv is not None:
+                    payload["items_value"] = (
+                        float(iv)
+                        if isinstance(iv, (int, float))
+                        else discord_notify._to_float(iv)
+                    )
+                if curr:
+                    payload["currency"] = curr
+        write_last_run_json(
+            {k: v for k, v in payload.items() if v is not None}
+        )
 
     def _setup_driver(self, headless):
         chrome_options = Options()
@@ -338,6 +391,7 @@ class HellcaseAutoOpener:
             self._load_cookies()
             if self._is_logged_in():
                 print("  ✓ Session valide")
+                self._session_valid_at_start = True
                 return
             print("  ⚠ Session expirée — nouvelle authentification Steam requise")
 
@@ -345,19 +399,30 @@ class HellcaseAutoOpener:
         # afficher de QR interactivement. On notifie Discord et on sort proprement.
         if not sys.stdin.isatty():
             print("  ✗ Pas de terminal interactif → impossible d'afficher le QR.")
+            sess = self._session_stats_dict()
+            discord_sent = False
             try:
-                discord_notify.notify_session_expired()
-                print("  📨 Alerte Discord envoyée (session expirée)")
+                discord_sent = bool(discord_notify.notify_session_expired(session_info=sess))
+                if discord_sent:
+                    print("  📨 Alerte Discord envoyée (session expirée)")
             except Exception as e:
                 print(f"  ⚠ Envoi Discord échoué : {e}")
+            self._write_last_run_compact(
+                status="abort_tty", discord_sent=discord_sent
+            )
             self.driver.quit()
             exit(2)
 
         if not steam_qr_auth(self.driver, self.cookies_file):
+            sess = self._session_stats_dict()
+            discord_sent = False
             try:
-                discord_notify.notify_session_expired()
+                discord_sent = bool(discord_notify.notify_session_expired(session_info=sess))
             except Exception:
                 pass
+            self._write_last_run_compact(
+                status="abort_qr", discord_sent=discord_sent
+            )
             self.driver.quit()
             exit(1)
 
@@ -569,13 +634,8 @@ class HellcaseAutoOpener:
             return {"name": name, "status": "skipped", "item": None,
                     "price": None, "reason": reason}
 
-        # Mémoriser les noms d'items déjà présents AVANT le clic (preview de la
-        # caisse) pour pouvoir ensuite identifier le nouveau drop.
-        pre_click_names = self._collect_item_names()
-
         try:
             button.click()
-            print("  ✓ Caisse ouverte")
         except Exception as e:
             print(f"  ✗ Erreur au clic : {e}")
             return {"name": name, "status": "error", "item": None,
@@ -584,98 +644,9 @@ class HellcaseAutoOpener:
         # Attendre la fin de l'animation de roulette (~8s)
         time.sleep(9)
 
-        item_name, item_price = self._extract_obtained_item(pre_click_names)
-        if item_name:
-            suffix = f" ({item_price})" if item_price else ""
-            print(f"  🎉 Item obtenu : {item_name}{suffix}")
-        return {"name": name, "status": "opened", "item": item_name,
-                "price": item_price, "reason": None}
-
-    def _collect_item_names(self):
-        """Retourne l'ensemble des noms d'items visibles sur la page."""
-        names = set()
-        try:
-            for el in self.driver.find_elements(By.CSS_SELECTOR, "[class*='_name_']"):
-                try:
-                    t = (el.text or "").strip()
-                    if t and 0 < len(t) < 80 and not t.isdigit():
-                        names.add(t)
-                except Exception:
-                    continue
-        except Exception:
-            pass
-        return names
-
-    def _extract_obtained_item(self, pre_click_names=None):
-        """Extrait le drop réel obtenu après ouverture.
-
-        Stratégie :
-        1. Cherche un conteneur de résultat (`_drop_`, `_result_`, `_prize_`, …)
-           qui apparaît après l'animation et contient l'item gagné.
-        2. Sinon, prend un `_name_` qui n'était PAS dans la preview de la caisse
-           (diff avec `pre_click_names`).
-        """
-        pre_click_names = pre_click_names or set()
-        name, price = None, None
-
-        # 1) Conteneurs de résultat typiques d'Hellcase
-        for container_sel in (
-            "[class*='_drop-result_']",
-            "[class*='_result_']",
-            "[class*='_prize_']",
-            "[class*='_drop_']",
-            "[class*='_won_']",
-            "[class*='_winning_']",
-            "[class*='core-entity-main']",
-        ):
-            try:
-                containers = self.driver.find_elements(By.CSS_SELECTOR, container_sel)
-            except Exception:
-                continue
-            for c in containers:
-                try:
-                    if not c.is_displayed():
-                        continue
-                    name_el = c.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
-                    if name_el:
-                        t = (name_el[0].text or "").strip()
-                        if t and len(t) < 80:
-                            name = t
-                    # Prix souvent en core-entity-main__price / core-price (plus en _price_)
-                    ex_name, ex_price = self._extract_item_from_container(c)
-                    if ex_price:
-                        price = ex_price
-                    if ex_name and not name:
-                        name = ex_name
-                    if name:
-                        break
-                except Exception:
-                    continue
-            if name:
-                break
-
-        # 2) Fallback : un nouveau nom d'item apparu après le clic
-        if not name:
-            current = self._collect_item_names()
-            new_names = current - pre_click_names
-            if new_names:
-                name = next(iter(new_names))
-
-        # Prix : chercher un prix associé au nom trouvé (ancien _price_ ou core-*)
-        if name and not price:
-            for xpath in (
-                f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'_price_')]][1]",
-                f"//*[contains(@class,'_name_') and normalize-space(text())={name!r}]/ancestor::*[.//*[contains(@class,'core-entity-main__price') or contains(@class,'core-price')]][1]",
-            ):
-                try:
-                    parent = self.driver.find_element(By.XPATH, xpath)
-                    price = HellcaseAutoOpener._first_clean_price(parent)
-                    if price:
-                        break
-                except Exception:
-                    continue
-
-        return name, price
+        print("  ✓ Ouvert")
+        return {"name": name, "status": "opened", "item": None,
+                "price": None, "reason": None}
 
     @staticmethod
     def _parse_price_text(raw):
@@ -726,38 +697,6 @@ class HellcaseAutoOpener:
         except Exception:
             return (pel.text or "").replace("\n", " ").strip()
 
-    @staticmethod
-    def _first_clean_price(root_element):
-        """Premier prix 'propre' (entier ou décimal court) trouvé dans root."""
-        import re as _re
-        try:
-            for sel in PRICE_SELECTORS:
-                for el in root_element.find_elements(By.CSS_SELECTOR, sel):
-                    try:
-                        t = (el.text or "").strip().replace(",", ".").replace("\n", "")
-                        parsed = HellcaseAutoOpener._parse_price_text(t)
-                        if parsed and _re.fullmatch(r"\d{1,7}(?:\.\d{1,2})?", parsed):
-                            return parsed
-                    except Exception:
-                        continue
-        except Exception:
-            pass
-        return None
-
-    def _extract_item_from_container(self, container):
-        """Extrait (name, price) d'un conteneur de drop."""
-        name, price = None, None
-        try:
-            n = container.find_elements(By.CSS_SELECTOR, "[class*='_name_']")
-            if n:
-                t = (n[0].text or "").strip()
-                if t and len(t) < 80:
-                    name = t
-        except Exception:
-            pass
-        price = self._first_clean_price(container)
-        return name, price
-
     def run(self):
         print("=" * 60)
         print("🎮 HELLCASE - Ouverture automatique des caisses gratuites")
@@ -798,15 +737,27 @@ class HellcaseAutoOpener:
             if total > 0 or raw_balance is not None:
                 print(f"  💎 Valeur  : {discord_notify._fmt_price(total, currency=curr)}")
 
-        self._persist_cookies()
+        self._cookies_saved_after_run = self._persist_cookies()
+        sess = self._session_stats_dict()
 
-        # Notification Discord (ignorée silencieusement si webhook non configuré)
+        discord_sent = False
         try:
-            sent = discord_notify.notify_run_summary(results, inventory)
-            if sent:
+            discord_sent = bool(
+                discord_notify.notify_run_summary(
+                    results, inventory, session_info=sess
+                )
+            )
+            if discord_sent:
                 print("\n📨 Rapport envoyé sur Discord")
         except Exception as e:
             print(f"\n⚠ Envoi Discord échoué : {e}")
+
+        self._write_last_run_compact(
+            status="ok",
+            discord_sent=discord_sent,
+            results=results,
+            inventory=inventory,
+        )
 
         self.driver.quit()
 
@@ -990,8 +941,10 @@ class HellcaseAutoOpener:
                 with open(self.cookies_file, 'w') as f:
                     json.dump(cookies, f, indent=2)
                 print(f"💾 {len(cookies)} cookies rafraîchis dans '{self.cookies_file}'")
+                return True
         except Exception as e:
             print(f"⚠ Impossible de sauvegarder les cookies : {e}")
+        return False
 
 
 def main():

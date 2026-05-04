@@ -4,6 +4,9 @@ cookies.json
 # Config locale (contient l'URL du webhook Discord)
 config.json
 
+# Dernière exécution (résumé local : soldes, stats session)
+last_run.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
@@ -63,6 +63,24 @@ def _to_float(value):
         return None
 
 
+def _format_session_embed(session_info: dict[str, Any]) -> str:
+    """Texte français pour le champ Discord « Session / cookies »."""
+
+    def yn(val):
+        if val is None:
+            return "n/d"
+        return "oui" if val else "non"
+
+    lines = [
+        f"• Session valide au démarrage : **{yn(session_info.get('session_valid_at_start'))}**",
+        f"• Fichier cookies : **{'présent' if session_info.get('cookies_file_present') else 'absent'}**",
+    ]
+    saved = session_info.get("cookies_saved_after_run")
+    if saved is not None:
+        lines.append(f"• Cookies sauvegardés en fin de run : **{yn(saved)}**")
+    return "\n".join(lines)
+
+
 def _fmt_price(value, currency=None):
     """Formate une valeur numérique avec le symbole de devise."""
     if value is None or value == "":
@@ -99,6 +117,7 @@ def _post(webhook_url: str, payload: dict) -> bool:
 def notify_run_summary(
     cases_results: list[dict],
     inventory: Optional[dict] = None,
+    session_info: Optional[dict] = None,
     webhook_url: Optional[str] = None,
 ) -> bool:
     """Envoie un rapport de run à Discord.
@@ -109,6 +128,7 @@ def notify_run_summary(
     :param inventory: dict optionnel
         {"balance": str, "credits": str, "items_count": int,
          "items_value": str, "recent_items": list[dict]}
+    :param session_info: stats cookies / session (voir last_run.json)
     :param webhook_url: URL du webhook (sinon lue depuis la config)
     """
     url = webhook_url or _load_webhook_url()
@@ -133,6 +153,13 @@ def notify_run_summary(
 
     fields = []
 
+    if session_info:
+        fields.append({
+            "name": "Session / cookies",
+            "value": _format_session_embed(session_info),
+            "inline": False,
+        })
+
     # Détecter la devise (passée via inventory) pour formater les prix
     curr = (inventory or {}).get("currency")
 
@@ -142,10 +169,7 @@ def notify_run_summary(
         name = r.get("name", "?")
         status = r.get("status")
         if status == "opened":
-            item = r.get("item") or "?"
-            price = _fmt_price(r.get("price"), currency=curr)
-            suffix = f" — **{item}**" + (f" ({price})" if price else "")
-            lines.append(f"🎁 `{name}`{suffix}")
+            lines.append(f"🎁 `{name}` — **ouvert**")
         elif status == "skipped":
             reason = r.get("reason") or "indisponible"
             lines.append(f"⏸ `{name}` — _{reason}_")
@@ -206,30 +230,42 @@ def notify_run_summary(
     return _post(url, payload)
 
 
-def notify_session_expired(webhook_url: Optional[str] = None) -> bool:
+def notify_session_expired(
+    webhook_url: Optional[str] = None,
+    session_info: Optional[dict] = None,
+) -> bool:
     """Alerte Discord quand la session Steam est expirée et qu'un scan manuel
     est requis (cron ne peut pas afficher le QR)."""
     url = webhook_url or _load_webhook_url()
     if not url:
         return False
 
-    payload = {
-        "username": "Hellcase Bot",
-        "embeds": [{
-            "title": "🔒 Session Hellcase expirée",
-            "description": (
-                "Les cookies ne sont plus valides. Une nouvelle authentification "
-                "Steam via QR Code est nécessaire.\n\n"
-                "**Action requise :** connecte-toi en SSH au serveur et lance :\n"
-                "```bash\ncd /home/shanouhar/hellcase-daily-rewards\n"
-                "python3 hellcase_auto.py\n```\n"
-                "Puis scanne le QR affiché avec l'app Steam Mobile."
-            ),
-            "color": 0xE74C3C,
-            "timestamp": datetime.utcnow().isoformat() + "Z",
-            "footer": {"text": "hellcase-daily-rewards"},
-        }],
+    embed_fields = []
+    if session_info:
+        embed_fields.append({
+            "name": "Session / cookies",
+            "value": _format_session_embed(session_info),
+            "inline": False,
+        })
+
+    embed = {
+        "title": "🔒 Session Hellcase expirée",
+        "description": (
+            "Les cookies ne sont plus valides. Une nouvelle authentification "
+            "Steam via QR Code est nécessaire.\n\n"
+            "**Action requise :** connecte-toi en SSH au serveur et lance :\n"
+            "```bash\ncd /home/shanouhar/hellcase-daily-rewards\n"
+            "python3 hellcase_auto.py\n```\n"
+            "Puis scanne le QR affiché avec l'app Steam Mobile."
+        ),
+        "color": 0xE74C3C,
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "footer": {"text": "hellcase-daily-rewards"},
     }
+    if embed_fields:
+        embed["fields"] = embed_fields
+
+    payload = {"username": "Hellcase Bot", "embeds": [embed]}
     return _post(url, payload)
 
 
