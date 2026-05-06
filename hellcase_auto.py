@@ -842,24 +842,38 @@ class HellcaseAutoOpener:
         if any(m in section_text.lower() for m in empty_markers):
             return info
 
-        # Uniquement la grille « Vos objets » : cartes directes sous
-        # .profile-tab-items-new__items (pas le slider « Meilleurs objets » ni
-        # l'historique — ceux-ci sont dans __items-slider ou autres blocs).
-        slides = your_section.find_elements(
-            By.CSS_SELECTOR, ".profile-tab-items-new__items > .core-entity-profile"
-        )
-        if not slides:
-            slides = []
-            for el in your_section.find_elements(
-                By.CSS_SELECTOR, ".profile-tab-items-new__items .core-entity-profile"
-            ):
-                try:
-                    el.find_element(
-                        By.XPATH,
-                        "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
-                    )
-                except NoSuchElementException:
-                    slides.append(el)
+        # Première carte hors slider → même bloc .profile-tab-items-new__items
+        # (sans « items-slider ») : toutes les cartes de cette grille, pas seulement
+        # les enfants directs « > » qui en oublient souvent.
+        first_card = None
+        for el in your_section.find_elements(By.CSS_SELECTOR, ".core-entity-profile"):
+            try:
+                if "card" in (el.get_attribute("class") or ""):
+                    continue
+            except Exception:
+                pass
+            try:
+                el.find_element(
+                    By.XPATH,
+                    "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
+                )
+            except NoSuchElementException:
+                first_card = el
+                break
+
+        slides = []
+        if first_card is not None:
+            try:
+                items_grid = first_card.find_element(
+                    By.XPATH,
+                    "./ancestor::div[contains(@class,'profile-tab-items-new__items')"
+                    " and not(contains(@class,'items-slider'))][1]",
+                )
+                slides = items_grid.find_elements(
+                    By.CSS_SELECTOR, ".core-entity-profile",
+                )
+            except NoSuchElementException:
+                slides = [first_card]
 
         items = []
         for slide in slides:
@@ -868,6 +882,14 @@ class HellcaseAutoOpener:
                 if "card" in (slide.get_attribute("class") or ""):
                     continue
             except Exception:
+                pass
+            try:
+                slide.find_element(
+                    By.XPATH,
+                    "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
+                )
+                continue
+            except NoSuchElementException:
                 pass
 
             # Nom de l'item : subtitle = catégorie (★ Knife / AK-47…), title = skin
