@@ -731,7 +731,7 @@ class HellcaseAutoOpener:
             return (el.text or "").replace("\n", " ").strip()
 
     def _sell_all_items_value_str(self, your_section, currency_symbol=None):
-        """Montant affiché sur le bouton « vendre tous les articles » (reprise bulk)."""
+        """Montant « vendre tous les articles » : priorité au span ._price_* dans le bouton."""
         for root in (your_section, self.driver.find_element(By.TAG_NAME, "body")):
             try:
                 for el in root.find_elements(By.CSS_SELECTOR, "button, a, [role='button']"):
@@ -747,6 +747,25 @@ class HellcaseAutoOpener:
                     bulk_en = "sell" in lo and "all" in lo and "item" in lo
                     if not (bulk_fr or bulk_en):
                         continue
+                    # Ex. <span class="_price_11qqy_12">1.00</span> — montant nu, sans icône devise
+                    try:
+                        span = el.find_element(
+                            By.CSS_SELECTOR, "span[class*='_price_']"
+                        )
+                        raw = (span.text or "").strip().replace(",", ".")
+                        if raw:
+                            parsed = HellcaseAutoOpener._parse_price_cell_display(
+                                raw.replace(" ", ""),
+                                currency_symbol=currency_symbol,
+                            )
+                            if not parsed:
+                                parsed = HellcaseAutoOpener._parse_price_text(
+                                    raw, currency_symbol=currency_symbol
+                                )
+                            if parsed:
+                                return str(parsed).replace(",", ".")
+                    except NoSuchElementException:
+                        pass
                     t = HellcaseAutoOpener._element_text_without_currency_icons(
                         self.driver, el
                     )
