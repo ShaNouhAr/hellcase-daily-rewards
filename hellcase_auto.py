@@ -51,6 +51,31 @@ CURRENCY_MAP = {
     "80": "lei", # RON
 }
 
+
+def hellcase_currency_codes_for_symbol(currency_symbol):
+    """Codes font « Currencies » pour un symbole (du plus long au plus court)."""
+    if not currency_symbol:
+        return []
+    return sorted(
+        [k for k, v in CURRENCY_MAP.items() if v == currency_symbol],
+        key=len,
+        reverse=True,
+    )
+
+
+def hellcase_strip_leading_currency_code(text, currency_symbol):
+    """Retire le préfixe code devise collé au montant (ex. € → «2», «22.29» → «2.29»)."""
+    if not text or not currency_symbol:
+        return (text or "").strip()
+    s = str(text).strip().replace("\xa0", " ")
+    for code in hellcase_currency_codes_for_symbol(currency_symbol):
+        if s.startswith(code):
+            rest = s[len(code):].lstrip(" \t")
+            if rest and rest[0].isdigit():
+                return rest
+    return s
+
+
 # Fallback si la détection automatique échoue
 FALLBACK_CASES = [
     {'name': 'NEWBIE', 'url': '/fr/open/newbie'},
@@ -648,19 +673,21 @@ class HellcaseAutoOpener:
                 "price": None, "reason": None}
 
     @staticmethod
-    def _parse_price_text(raw):
+    def _parse_price_text(raw, currency_symbol=None):
         """Extrait un nombre prix depuis le texte (ignore bruit / devise obfusquée)."""
         import re as _re
         if not raw:
             return None
-        t = raw.strip().replace("\n", " ")
+        t = hellcase_strip_leading_currency_code(
+            raw.strip().replace("\n", " "), currency_symbol
+        )
         m = _re.search(r"(\d{1,7}(?:[.,]\d{1,2})?)", t.replace(",", "."))
         if not m:
             return None
         return m.group(1).replace(",", ".")
 
     @staticmethod
-    def _parse_price_cell_display(raw):
+    def _parse_price_cell_display(raw, currency_symbol=None):
         """Prix affiché type inventaire Hellcase : priorité aux montants à 2 décimales.
 
         Évite de prendre le premier entier parasite dans une cellule plus large.
@@ -668,7 +695,9 @@ class HellcaseAutoOpener:
         import re as _re
         if not raw:
             return None
-        t = raw.replace("\xa0", " ").replace(" ", "")
+        t = hellcase_strip_leading_currency_code(
+            raw.replace("\xa0", " ").replace(" ", ""), currency_symbol
+        )
         t = t.replace(",", ".")
         # Montants style 0.14 ou 12.50 (2 décimales, ce que les cartes inventaire affichent)
         ms = _re.findall(r"\d+\.\d{2}\b", t)
@@ -701,7 +730,7 @@ class HellcaseAutoOpener:
         except Exception:
             return (el.text or "").replace("\n", " ").strip()
 
-    def _sell_all_items_value_str(self, your_section):
+    def _sell_all_items_value_str(self, your_section, currency_symbol=None):
         """Montant affiché sur le bouton « vendre tous les articles » (reprise bulk)."""
         for root in (your_section, self.driver.find_element(By.TAG_NAME, "body")):
             try:
@@ -723,11 +752,16 @@ class HellcaseAutoOpener:
                     )
                     if not t:
                         t = t_raw
+                    if currency_symbol:
+                        t = hellcase_strip_leading_currency_code(t, currency_symbol)
                     parsed = HellcaseAutoOpener._parse_price_cell_display(
-                        t.replace(",", ".").replace(" ", "")
+                        t.replace(",", ".").replace(" ", ""),
+                        currency_symbol=currency_symbol,
                     )
                     if not parsed:
-                        parsed = HellcaseAutoOpener._parse_price_text(t)
+                        parsed = HellcaseAutoOpener._parse_price_text(
+                            t, currency_symbol=currency_symbol
+                        )
                     if parsed:
                         return str(parsed).replace(",", ".")
             except Exception:
@@ -841,6 +875,8 @@ class HellcaseAutoOpener:
                 pass
 
             txt = (bal.text or "").strip().replace("\n", " ")
+            if info.get("currency"):
+                txt = hellcase_strip_leading_currency_code(txt, info["currency"])
             import re as _re
             nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
             if nums:
@@ -869,7 +905,9 @@ class HellcaseAutoOpener:
         if any(m in section_text.lower() for m in empty_markers):
             return info
 
-        sell_all = self._sell_all_items_value_str(your_section)
+        sell_all = self._sell_all_items_value_str(
+            your_section, currency_symbol=info.get("currency")
+        )
         if sell_all is not None:
             info["items_value"] = sell_all
 
