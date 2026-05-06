@@ -332,7 +332,6 @@ class HellcaseAutoOpener:
             if inventory:
                 curr = inventory.get("currency")
                 payload["balance"] = inventory.get("balance")
-                payload["items"] = inventory.get("items_count")
                 iv = inventory.get("items_value")
                 if iv is not None:
                     payload["items_value"] = (
@@ -681,76 +680,33 @@ class HellcaseAutoOpener:
         # Plusieurs nombres concaténés / bruit : le prix affiché est en général le dernier token
         return ms[-1]
 
-    def _profile_slide_price(self, slide):
-        """Prix d'une carte inventaire : cellule prix + repli sur .core-entity__top-left uniquement."""
-        for psel in (
-            ".core-entity__top-left .core-entity-profile__price",
-            ".core-entity__top-left .core-price",
-            ".core-entity-profile__price",
-            ".core-price.core-entity-profile__price",
-        ):
+    def _sell_all_items_value_str(self, your_section):
+        """Montant affiché sur le bouton « vendre tous les articles » (reprise bulk)."""
+        for root in (your_section, self.driver.find_element(By.TAG_NAME, "body")):
             try:
-                pel = slide.find_element(By.CSS_SELECTOR, psel)
-                raw = HellcaseAutoOpener._price_amount_text_from_core_price_element(
-                    self.driver, pel
-                )
-                parsed = HellcaseAutoOpener._parse_price_cell_display(
-                    (raw or "").replace(" ", "")
-                )
-                if not parsed:
-                    parsed = HellcaseAutoOpener._parse_price_text(raw)
-                if parsed:
-                    return float(parsed)
-            except (NoSuchElementException, ValueError):
+                for el in root.find_elements(By.CSS_SELECTOR, "button, a, [role='button']"):
+                    t = (el.text or "").replace("\xa0", " ").replace("\n", " ")
+                    if len(t) > 120:
+                        continue
+                    lo = t.lower()
+                    bulk_fr = (
+                        "vendre" in lo
+                        and ("tous" in lo or "tout" in lo)
+                        and ("article" in lo or "objet" in lo)
+                    )
+                    bulk_en = "sell" in lo and "all" in lo and "item" in lo
+                    if not (bulk_fr or bulk_en):
+                        continue
+                    parsed = HellcaseAutoOpener._parse_price_cell_display(
+                        t.replace(",", ".").replace(" ", "")
+                    )
+                    if not parsed:
+                        parsed = HellcaseAutoOpener._parse_price_text(t)
+                    if parsed:
+                        return str(parsed).replace(",", ".")
+            except Exception:
                 continue
-        try:
-            tl = slide.find_element(By.CSS_SELECTOR, ".core-entity__top-left")
-            txt = (tl.text or "").replace("\n", " ")
-            parsed = HellcaseAutoOpener._parse_price_cell_display(txt)
-            if not parsed:
-                parsed = HellcaseAutoOpener._parse_price_text(txt)
-            if parsed:
-                return float(parsed)
-        except NoSuchElementException:
-            pass
         return None
-
-    @staticmethod
-    def _price_amount_text_from_core_price_element(driver, pel):
-        """Texte du montant seul dans un bloc .core-price (sans l'icône devise).
-
-        Hellcase affiche l'euro comme un caractère « 2 » dans .core-currency-icon ;
-        Selenium concatène en « 20.14 » au lieu de « 0.14 » si on lit pel.text.
-        """
-        try:
-            s = driver.execute_script(
-                r"""
-                const el = arguments[0];
-                if (!el) return '';
-                let out = '';
-                for (const n of el.childNodes) {
-                  if (n.nodeType === 3) {
-                    out += (n.textContent || '');
-                  } else if (n.nodeType === 1) {
-                    if (n.classList && n.classList.contains('core-currency-icon')) continue;
-                    out += (n.innerText || n.textContent || '');
-                  }
-                }
-                let s = out.replace(/\s+/g, '').trim();
-                if (!s || !/\d/.test(s)) {
-                  let t = '';
-                  el.querySelectorAll('span:not(.core-currency-icon)').forEach(
-                    x => { t += (x.innerText || x.textContent || ''); });
-                  s = t.replace(/\s+/g, '').trim();
-                }
-                if (!s) s = (el.innerText || '').replace(/\s+/g, '').trim();
-                return s;
-                """,
-                pel,
-            )
-            return (s or "").strip()
-        except Exception:
-            return (pel.text or "").replace("\n", " ").strip()
 
     def run(self):
         print("=" * 60)
@@ -785,11 +741,11 @@ class HellcaseAutoOpener:
             balance = discord_notify._fmt_price(raw_balance, currency=curr)
             if balance:
                 print(f"  💵 Solde   : {balance}")
-            if inventory.get("items_count") is not None:
+            if inventory.get("items_value") is not None:
                 items_val = discord_notify._fmt_price(raw_items or 0, currency=curr)
-                print(f"  📦 Items   : {inventory['items_count']} ({items_val})")
+                print(f"  📦 Inventaire (reprise) : {items_val}")
             total = (raw_balance or 0) + (raw_items or 0)
-            if total > 0 or raw_balance is not None:
+            if total > 0 or raw_balance is not None or raw_items is not None:
                 print(f"  💎 Valeur  : {discord_notify._fmt_price(total, currency=curr)}")
 
         self._cookies_saved_after_run = self._persist_cookies()
@@ -817,11 +773,10 @@ class HellcaseAutoOpener:
         self.driver.quit()
 
     def _fetch_inventory_summary(self):
-        """Scrape le profil pour récupérer solde / crédits / items.
+        """Scrape le profil : solde + valeur inventaire (bouton reprise « vendre tout »).
 
         Retourne None si la page est inaccessible. Sinon un dict :
-          {"balance": str, "credits": str, "items_count": int,
-           "items_value": str, "recent_items": list[dict]}
+          {"balance": str, "items_value": str, "currency": str|None}
         """
         try:
             self.driver.get(f"{BASE_URL}/fr/profile")
@@ -844,8 +799,7 @@ class HellcaseAutoOpener:
         except Exception:
             return None
 
-        info = {"balance": None, "items_count": None,
-                "items_value": None, "recent_items": [], "currency": None}
+        info = {"balance": None, "items_value": None, "currency": None}
 
         # Solde — div avec class "_balances_" contient l'icône devise + prix
         # Format DOM : <div class="_balances_*"><span class="currency-icon">X</span>2.77</div>
@@ -870,14 +824,7 @@ class HellcaseAutoOpener:
         except NoSuchElementException:
             pass
 
-        # Items d'inventaire : on cible EXCLUSIVEMENT la section "Vos objets"
-        # sur le profil (sinon on ramasse par erreur les "Meilleurs objets"
-        # qui sont les top drops du site, pas les items de l'utilisateur).
-        import re as _re
-
-        info["items_count"] = 0
-        info["items_value"] = 0
-
+        # Valeur inventaire = montant affiché sur « Vendre tous les articles » (reprise bulk).
         try:
             your_section = self.driver.find_element(
                 By.XPATH,
@@ -889,7 +836,6 @@ class HellcaseAutoOpener:
                 "                   or normalize-space(.)='Seus itens')]]"
             )
         except NoSuchElementException:
-            # Pas de section "Vos objets" visible → inventaire vide par défaut
             return info
 
         section_text = (your_section.text or "")
@@ -897,85 +843,9 @@ class HellcaseAutoOpener:
         if any(m in section_text.lower() for m in empty_markers):
             return info
 
-        # Première carte hors slider → même bloc .profile-tab-items-new__items
-        # (sans « items-slider ») : toutes les cartes de cette grille, pas seulement
-        # les enfants directs « > » qui en oublient souvent.
-        first_card = None
-        for el in your_section.find_elements(By.CSS_SELECTOR, ".core-entity-profile"):
-            try:
-                if "card" in (el.get_attribute("class") or ""):
-                    continue
-            except Exception:
-                pass
-            try:
-                el.find_element(
-                    By.XPATH,
-                    "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
-                )
-            except NoSuchElementException:
-                first_card = el
-                break
-
-        slides = []
-        if first_card is not None:
-            try:
-                items_grid = first_card.find_element(
-                    By.XPATH,
-                    "./ancestor::div[contains(@class,'profile-tab-items-new__items')"
-                    " and not(contains(@class,'items-slider'))][1]",
-                )
-                slides_dc = items_grid.find_elements(
-                    By.CSS_SELECTOR, ":scope > .core-entity-profile",
-                )
-                slides = (
-                    slides_dc
-                    if slides_dc
-                    else items_grid.find_elements(
-                        By.CSS_SELECTOR, ".core-entity-profile",
-                    )
-                )
-            except NoSuchElementException:
-                slides = [first_card]
-
-        items = []
-        for slide in slides:
-            # Ignorer cartes type promo / placeholder sans vrai item
-            try:
-                if "card" in (slide.get_attribute("class") or ""):
-                    continue
-            except Exception:
-                pass
-            try:
-                slide.find_element(
-                    By.XPATH,
-                    "./ancestor::div[contains(@class,'profile-tab-items-new__items-slider')]",
-                )
-                continue
-            except NoSuchElementException:
-                pass
-
-            # Nom de l'item : subtitle = catégorie (★ Knife / AK-47…), title = skin
-            name_text = None
-            for sel in (".core-entity-profile__title", ".core-entity-profile__subtitle"):
-                try:
-                    el = slide.find_element(By.CSS_SELECTOR, sel)
-                    t = (el.text or "").strip()
-                    if t:
-                        name_text = t if not name_text else f"{t} — {name_text}".strip(" —")
-                except NoSuchElementException:
-                    continue
-
-            price_val = self._profile_slide_price(slide)
-
-            if name_text or price_val is not None:
-                items.append({"name": name_text or "?", "price": price_val})
-
-        # Pas de dédoublonnage (nom, prix) : deux skins identiques même prix = 2 lignes réelles.
-        info["items_count"] = len(items)
-        info["recent_items"] = items[:10]
-        info["items_value"] = round(
-            sum(i["price"] for i in items if i["price"] is not None), 2
-        )
+        sell_all = self._sell_all_items_value_str(your_section)
+        if sell_all is not None:
+            info["items_value"] = sell_all
 
         return info
 

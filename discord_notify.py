@@ -126,8 +126,7 @@ def notify_run_summary(
         {"name": str, "status": "opened"|"skipped"|"error",
          "item": Optional[str], "price": Optional[str], "reason": Optional[str]}
     :param inventory: dict optionnel
-        {"balance": str, "credits": str, "items_count": int,
-         "items_value": str, "recent_items": list[dict]}
+        {"balance": str, "items_value": str, "currency": str|None}
     :param session_info: stats cookies / session (voir last_run.json)
     :param webhook_url: URL du webhook (sinon lue depuis la config)
     """
@@ -199,11 +198,9 @@ def notify_run_summary(
         balance = _fmt_price(raw_balance, currency=curr)
         if balance:
             inv_lines.append(f"💵 Solde : **{balance}**")
-        if inventory.get("items_count") is not None:
+        if inventory.get("items_value") is not None:
             items_val = _fmt_price(raw_items_value or 0, currency=curr)
-            inv_lines.append(
-                f"📦 Items : **{inventory['items_count']}** ({items_val})"
-            )
+            inv_lines.append(f"📦 Inventaire (reprise) : **{items_val}**")
         # Valeur totale = solde + valeur des items
         total = (raw_balance or 0) + (raw_items_value or 0)
         if total > 0 or raw_balance is not None or raw_items_value is not None:
