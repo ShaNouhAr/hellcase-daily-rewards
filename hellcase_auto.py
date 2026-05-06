@@ -680,15 +680,36 @@ class HellcaseAutoOpener:
         # Plusieurs nombres concaténés / bruit : le prix affiché est en général le dernier token
         return ms[-1]
 
+    @staticmethod
+    def _element_text_without_currency_icons(driver, el):
+        """Texte du nœud sans les spans d'icône devise (évite « 2 » collé à 1.00 → 21)."""
+        try:
+            return driver.execute_script(
+                r"""
+                function walk(n) {
+                  let s = '';
+                  if (n.nodeType === 3) return n.textContent || '';
+                  if (n.nodeType !== 1) return '';
+                  if (n.classList && n.classList.contains('core-currency-icon')) return '';
+                  for (const c of n.childNodes) s += walk(c);
+                  return s;
+                }
+                return (walk(arguments[0]) || '').replace(/\s+/g, ' ').trim();
+                """,
+                el,
+            )
+        except Exception:
+            return (el.text or "").replace("\n", " ").strip()
+
     def _sell_all_items_value_str(self, your_section):
         """Montant affiché sur le bouton « vendre tous les articles » (reprise bulk)."""
         for root in (your_section, self.driver.find_element(By.TAG_NAME, "body")):
             try:
                 for el in root.find_elements(By.CSS_SELECTOR, "button, a, [role='button']"):
-                    t = (el.text or "").replace("\xa0", " ").replace("\n", " ")
-                    if len(t) > 120:
+                    t_raw = (el.text or "").replace("\xa0", " ").replace("\n", " ")
+                    if len(t_raw) > 120:
                         continue
-                    lo = t.lower()
+                    lo = t_raw.lower()
                     bulk_fr = (
                         "vendre" in lo
                         and ("tous" in lo or "tout" in lo)
@@ -697,6 +718,11 @@ class HellcaseAutoOpener:
                     bulk_en = "sell" in lo and "all" in lo and "item" in lo
                     if not (bulk_fr or bulk_en):
                         continue
+                    t = HellcaseAutoOpener._element_text_without_currency_icons(
+                        self.driver, el
+                    )
+                    if not t:
+                        t = t_raw
                     parsed = HellcaseAutoOpener._parse_price_cell_display(
                         t.replace(",", ".").replace(" ", "")
                     )
