@@ -661,6 +661,61 @@ class HellcaseAutoOpener:
         return m.group(1).replace(",", ".")
 
     @staticmethod
+    def _parse_price_cell_display(raw):
+        """Prix affiché type inventaire Hellcase : priorité aux montants à 2 décimales.
+
+        Évite de prendre le premier entier parasite dans une cellule plus large.
+        """
+        import re as _re
+        if not raw:
+            return None
+        t = raw.replace("\xa0", " ").replace(" ", "")
+        t = t.replace(",", ".")
+        # Montants style 0.14 ou 12.50 (2 décimales, ce que les cartes inventaire affichent)
+        ms = _re.findall(r"\d+\.\d{2}\b", t)
+        if not ms:
+            m = _re.search(r"(\d+\.\d{1,2})\b", t)
+            return m.group(1) if m else None
+        if len(ms) == 1:
+            return ms[0]
+        # Plusieurs nombres concaténés / bruit : le prix affiché est en général le dernier token
+        return ms[-1]
+
+    def _profile_slide_price(self, slide):
+        """Prix d'une carte inventaire : cellule prix + repli sur .core-entity__top-left uniquement."""
+        for psel in (
+            ".core-entity__top-left .core-entity-profile__price",
+            ".core-entity__top-left .core-price",
+            ".core-entity-profile__price",
+            ".core-price.core-entity-profile__price",
+        ):
+            try:
+                pel = slide.find_element(By.CSS_SELECTOR, psel)
+                raw = HellcaseAutoOpener._price_amount_text_from_core_price_element(
+                    self.driver, pel
+                )
+                parsed = HellcaseAutoOpener._parse_price_cell_display(
+                    (raw or "").replace(" ", "")
+                )
+                if not parsed:
+                    parsed = HellcaseAutoOpener._parse_price_text(raw)
+                if parsed:
+                    return float(parsed)
+            except (NoSuchElementException, ValueError):
+                continue
+        try:
+            tl = slide.find_element(By.CSS_SELECTOR, ".core-entity__top-left")
+            txt = (tl.text or "").replace("\n", " ")
+            parsed = HellcaseAutoOpener._parse_price_cell_display(txt)
+            if not parsed:
+                parsed = HellcaseAutoOpener._parse_price_text(txt)
+            if parsed:
+                return float(parsed)
+        except NoSuchElementException:
+            pass
+        return None
+
+    @staticmethod
     def _price_amount_text_from_core_price_element(driver, pel):
         """Texte du montant seul dans un bloc .core-price (sans l'icône devise).
 
@@ -869,8 +924,15 @@ class HellcaseAutoOpener:
                     "./ancestor::div[contains(@class,'profile-tab-items-new__items')"
                     " and not(contains(@class,'items-slider'))][1]",
                 )
-                slides = items_grid.find_elements(
-                    By.CSS_SELECTOR, ".core-entity-profile",
+                slides_dc = items_grid.find_elements(
+                    By.CSS_SELECTOR, ":scope > .core-entity-profile",
+                )
+                slides = (
+                    slides_dc
+                    if slides_dc
+                    else items_grid.find_elements(
+                        By.CSS_SELECTOR, ".core-entity-profile",
+                    )
                 )
             except NoSuchElementException:
                 slides = [first_card]
@@ -903,53 +965,17 @@ class HellcaseAutoOpener:
                 except NoSuchElementException:
                     continue
 
-            # Prix : bloc .core-entity__top-left uniquement (pas les boutons Vendre).
-            # Montant via JS : exclure .core-currency-icon (sinon « 2 »+« 0.14 » → « 20.14 »).
-            price_val = None
-            for psel in (
-                ".core-entity__top-left .core-entity-profile__price",
-                ".core-entity__top-left .core-price",
-                ".core-entity-profile__price",
-                ".core-price.core-entity-profile__price",
-            ):
-                try:
-                    pel = slide.find_element(By.CSS_SELECTOR, psel)
-                    raw = HellcaseAutoOpener._price_amount_text_from_core_price_element(
-                        self.driver, pel
-                    )
-                    parsed = HellcaseAutoOpener._parse_price_text(raw.replace(" ", ""))
-                    if parsed:
-                        price_val = float(parsed)
-                        break
-                except (NoSuchElementException, ValueError):
-                    continue
-            if price_val is None:
-                txt = (slide.text or "").replace("\n", " ")
-                nums = _re.findall(r"\d+(?:[.,]\d{1,2})?", txt)
-                with_dec = [n for n in nums if "." in n or "," in n]
-                candidate = (with_dec[0] if with_dec else (nums[0] if nums else None))
-                if candidate:
-                    try:
-                        price_val = float(candidate.replace(",", "."))
-                    except ValueError:
-                        pass
+            price_val = self._profile_slide_price(slide)
 
             if name_text or price_val is not None:
                 items.append({"name": name_text or "?", "price": price_val})
 
-        # Dédoublonner par (name, price) — un même item peut apparaître plusieurs fois
-        seen = set()
-        uniq_items = []
-        for it in items:
-            key = (it["name"], it["price"])
-            if key in seen:
-                continue
-            seen.add(key)
-            uniq_items.append(it)
-
-        info["items_count"] = len(uniq_items)
-        info["recent_items"] = uniq_items[:10]
-        info["items_value"] = sum(i["price"] for i in uniq_items if i["price"] is not None)
+        # Pas de dédoublonnage (nom, prix) : deux skins identiques même prix = 2 lignes réelles.
+        info["items_count"] = len(items)
+        info["recent_items"] = items[:10]
+        info["items_value"] = round(
+            sum(i["price"] for i in items if i["price"] is not None), 2
+        )
 
         return info
 
